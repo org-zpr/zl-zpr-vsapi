@@ -142,6 +142,14 @@
 #     authError. On success policy is re-run under the current snapshot and
 #     authExpires is the new minimum across the renewed authorities.
 #
+#   * One exception to the exact-set rule: a node renewing its own actor (the
+#     node's own ZPR address) may change its 'user' namespace. It may gain it
+#     (login: an OIDC blob whose nonce came from getLoginNonce) or drop it
+#     (logout: no OIDC blob; every user attribute is removed). The self-signed
+#     'device' blob is still required, and the 'device' namespace can never be
+#     gained or dropped. Every other reauthorize, including a node renewing an
+#     adapter docked to it, keeps the exact-set rule.
+#
 #
 # Visa Requests:
 #

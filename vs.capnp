@@ -366,9 +366,11 @@ interface VSHandle {
   # plus its configured initial links, and replaces everything this node reported
   # before. A link the node does not list is not up. The node sends a snapshot
   # whenever a link state changes, and again after every (re)connect to the visa
-  # service. The visa service logs and ignores entries whose peerCn is not in this
-  # node's current topology (a report can race a topology change); that is not an
-  # error.
+  # service. The visa service accepts an entry whose peerCn is a peer of this node
+  # in its current topology or in the links policy declares for it (which include
+  # its configured initial links), whether or not setTopology has delivered that
+  # link yet. It logs and ignores any other entry (a report can race a topology
+  # change); that is not an error.
   reportLinkStates  @8 (links :List(LinkStateReport)) -> (res :OkOrError);
 
   # The node's substrate address (the address peers dial, as in the

@@ -142,13 +142,17 @@
 #     authError. On success policy is re-run under the current snapshot and
 #     authExpires is the new minimum across the renewed authorities.
 #
-#   * One exception to the exact-set rule: a node renewing its own actor (the
-#     node's own ZPR address) may change its 'user' namespace. It may gain it
-#     (login: an OIDC blob whose nonce came from getLoginNonce) or drop it
-#     (logout: no OIDC blob; every user attribute is removed). The self-signed
-#     'device' blob is still required, and the 'device' namespace can never be
-#     gained or dropped. Every other reauthorize, including a node renewing an
-#     adapter docked to it, keeps the exact-set rule.
+#   * The exact-set rule always holds for an adapter actor (one docked via a
+#     node). One exception applies to a node renewing its OWN actor (the node's
+#     own ZPR address), which may change its 'user' namespace:
+#       - Gain (login): the request adds an OIDC blob. Its id_token's `nonce`
+#         must equal an unexpired, unused login nonce that getLoginNonce issued,
+#         bound on the visa-service side to this actor and VS-API session.
+#       - Drop (logout): the request omits the OIDC blob; every user attribute
+#         is removed.
+#     The self-signed 'device' blob (the node's RSA proof) is mandatory either
+#     way, and the 'device' namespace can never be gained or dropped. Any other
+#     set mismatch is still a paramError.
 #
 #
 # Visa Requests:
@@ -383,6 +387,7 @@ interface VSHandle {
   # the id_token's `nonce` claim equals an unexpired nonce the visa service issued
   # to this node and has not yet used. The schema carries no binding fields: the
   # binding lives on the visa-service side.
+  # See "Re-Authorization" above for the namespace-gain exception this serves.
   # Errors: authRequired on a dead handle; quotaExceeded when the node already
   # holds the maximum number of outstanding nonces.
   getLoginNonce     @10 () -> (res :Result(LoginNonce));

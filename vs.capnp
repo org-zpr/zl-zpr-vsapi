@@ -142,6 +142,18 @@
 #     authError. On success policy is re-run under the current snapshot and
 #     authExpires is the new minimum across the renewed authorities.
 #
+#   * The exact-set rule always holds for an adapter actor (one docked via a
+#     node). One exception applies to a node renewing its OWN actor (the node's
+#     own ZPR address), which may change its 'user' namespace:
+#       - Gain (login): the request adds an OIDC blob. Its id_token's `nonce`
+#         must equal an unexpired, unused login nonce that getLoginNonce issued,
+#         bound on the visa-service side to this actor and VS-API session.
+#       - Drop (logout): the request omits the OIDC blob; every user attribute
+#         is removed.
+#     The self-signed 'device' blob (the node's RSA proof) is mandatory either
+#     way, and the 'device' namespace can never be gained or dropped. Any other
+#     set mismatch is still a paramError.
+#
 #
 # Visa Requests:
 #
@@ -348,6 +360,44 @@ interface VSHandle {
   visaRequestById   @6 (req :List(UInt64)) -> (res :Result(List(Visa)));
 
   visaIdsRequest    @7 () -> (res :Result(List(UInt64)));
+
+  # The node reports the current state of its links (see "Topology / Links").
+  # Snapshot semantics: each call lists every link in the node's current topology
+  # plus its configured initial links, and replaces everything this node reported
+  # before. A link the node does not list is not up. The node sends a snapshot
+  # whenever a link state changes, and again after every (re)connect to the visa
+  # service. The visa service accepts an entry whose peerCn is a peer of this node
+  # in its current topology or in the links policy declares for it (which include
+  # its configured initial links), whether or not setTopology has delivered that
+  # link yet. It logs and ignores any other entry (a report can race a topology
+  # change); that is not an error.
+  reportLinkStates  @8 (links :List(LinkStateReport)) -> (res :OkOrError);
+
+  # The node's substrate address (the address peers dial, as in the
+  # `substrate_addr` connect param) changed. Sent over the existing session, with
+  # no re-authentication. The visa service updates the node's substrate address
+  # and re-sends setTopology to the node's peers.
+  # Error paramError: unspecified IP or port 0.
+  updateSubstrateAddr @9 (addr :SockAddr) -> (res :OkOrError);
+
+  # The node asks for a nonce for its own OIDC login (adding user attributes to
+  # its own actor through `reauthorize`). The visa service mints a fresh,
+  # unpredictable value and binds it, on its side, to the calling node's actor and
+  # VS-API session; the nonce is single-use and expires at `LoginNonce.expiresAt`.
+  # The node passes it to ph-cli as the authorization request's `nonce`, and
+  # returns it in `OidcBlob.nonce`. A login (namespace gain) is accepted only when
+  # the id_token's `nonce` claim equals an unexpired nonce the visa service issued
+  # to this node and has not yet used. The schema carries no binding fields: the
+  # binding lives on the visa-service side.
+  # See "Re-Authorization" above for the namespace-gain exception this serves.
+  # Errors: authRequired on a dead handle; quotaExceeded when the node already
+  # holds the maximum number of outstanding nonces.
+  getLoginNonce     @10 () -> (res :Result(LoginNonce));
+}
+
+struct LoginNonce {
+  nonce     @0 :Text;    # the OIDC `nonce` value, used verbatim
+  expiresAt @1 :UInt64;  # unix timestamp (seconds); unusable after this time
 }
 
 struct OkOrError {
@@ -714,15 +764,35 @@ struct Ack {
 # Topology / Links
 # ---------------------------------------------------
 
+# The visa service tells a node which links to have with setTopology. The node
+# tells the visa service which of them are up with VSHandle.reportLinkStates; the
+# visa service routes over a link only when both of its ends report it up.
+
 struct Link {
   linkId   @0 :Text;     # unique, for debugging.
   peer     @1 :SockAddr; # substrate address of the peer
   role     @2 :LinkRole;
   visas    @3 :List(Visa);  # bootstrap visas to aid in joins
   zprAddr  @4 :IpAddr;   # ZPR address of the peer. May be unset (older senders).
+  peerCn   @5 :Text;     # CN on the peer's CA-signed link certificate. The
+                         # receiving node accepts this link only from a peer
+                         # whose verified certificate carries exactly this CN.
+                         # Empty (older senders) means no peer can satisfy the
+                         # check.
 }
 
 enum LinkRole {
   active  @0;
   backup  @1;
+}
+
+struct LinkStateReport {
+  peerCn @0 :Text;       # the peer's link-certificate CN, as in Link.peerCn
+  state  @1 :LinkState;
+}
+
+enum LinkState {
+  up     @0;  # established, and the peer's certificate verified with CN == peerCn
+  down   @1;  # was up, and is now lost or closed
+  failed @2;  # could not be established (no answer, handshake or certificate refused)
 }

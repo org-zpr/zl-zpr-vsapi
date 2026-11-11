@@ -369,13 +369,20 @@ interface VSHandle {
   # The node asks for a nonce for its own OIDC login (adding user attributes to
   # its own actor through `reauthorize`). The visa service mints a fresh,
   # unpredictable value and binds it, on its side, to the calling node's actor and
-  # VS-API session; the nonce is single-use and expires after a time the visa
-  # service chooses. The node passes it to ph-cli as the authorization request's
-  # `nonce`, and returns it in `OidcBlob.nonce`. A login (namespace gain) is
-  # accepted only when the id_token's `nonce` claim equals a nonce the visa
-  # service issued to this node and has not yet used. The schema carries no
-  # binding fields: the session is the binding.
-  getLoginNonce     @10 () -> (res :Result(Text));
+  # VS-API session; the nonce is single-use and expires at `LoginNonce.expiresAt`.
+  # The node passes it to ph-cli as the authorization request's `nonce`, and
+  # returns it in `OidcBlob.nonce`. A login (namespace gain) is accepted only when
+  # the id_token's `nonce` claim equals an unexpired nonce the visa service issued
+  # to this node and has not yet used. The schema carries no binding fields: the
+  # binding lives on the visa-service side.
+  # Errors: authRequired on a dead handle; quotaExceeded when the node already
+  # holds the maximum number of outstanding nonces.
+  getLoginNonce     @10 () -> (res :Result(LoginNonce));
+}
+
+struct LoginNonce {
+  nonce     @0 :Text;    # the OIDC `nonce` value, used verbatim
+  expiresAt @1 :UInt64;  # unix timestamp (seconds); unusable after this time
 }
 
 struct OkOrError {

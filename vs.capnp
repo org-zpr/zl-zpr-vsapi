@@ -348,6 +348,34 @@ interface VSHandle {
   visaRequestById   @6 (req :List(UInt64)) -> (res :Result(List(Visa)));
 
   visaIdsRequest    @7 () -> (res :Result(List(UInt64)));
+
+  # The node reports the current state of its links (see "Topology / Links").
+  # Snapshot semantics: each call lists every link in the node's current topology
+  # plus its configured initial links, and replaces everything this node reported
+  # before. A link the node does not list is not up. The node sends a snapshot
+  # whenever a link state changes, and again after every (re)connect to the visa
+  # service. The visa service logs and ignores entries whose peerCn is not in this
+  # node's current topology (a report can race a topology change); that is not an
+  # error.
+  reportLinkStates  @8 (links :List(LinkStateReport)) -> (res :OkOrError);
+
+  # The node's substrate address (the address peers dial, as in the
+  # `substrate_addr` connect param) changed. Sent over the existing session, with
+  # no re-authentication. The visa service updates the node's substrate address
+  # and re-sends setTopology to the node's peers.
+  # Error paramError: unspecified IP or port 0.
+  updateSubstrateAddr @9 (addr :SockAddr) -> (res :OkOrError);
+
+  # The node asks for a nonce for its own OIDC login (adding user attributes to
+  # its own actor through `reauthorize`). The visa service mints a fresh,
+  # unpredictable value and binds it, on its side, to the calling node's actor and
+  # VS-API session; the nonce is single-use and expires after a time the visa
+  # service chooses. The node passes it to ph-cli as the authorization request's
+  # `nonce`, and returns it in `OidcBlob.nonce`. A login (namespace gain) is
+  # accepted only when the id_token's `nonce` claim equals a nonce the visa
+  # service issued to this node and has not yet used. The schema carries no
+  # binding fields: the session is the binding.
+  getLoginNonce     @10 () -> (res :Result(Text));
 }
 
 struct OkOrError {
@@ -714,15 +742,35 @@ struct Ack {
 # Topology / Links
 # ---------------------------------------------------
 
+# The visa service tells a node which links to have with setTopology. The node
+# tells the visa service which of them are up with VSHandle.reportLinkStates; the
+# visa service routes over a link only when both of its ends report it up.
+
 struct Link {
   linkId   @0 :Text;     # unique, for debugging.
   peer     @1 :SockAddr; # substrate address of the peer
   role     @2 :LinkRole;
   visas    @3 :List(Visa);  # bootstrap visas to aid in joins
   zprAddr  @4 :IpAddr;   # ZPR address of the peer. May be unset (older senders).
+  peerCn   @5 :Text;     # CN on the peer's CA-signed link certificate. The
+                         # receiving node accepts this link only from a peer
+                         # whose verified certificate carries exactly this CN.
+                         # Empty (older senders) means no peer can satisfy the
+                         # check.
 }
 
 enum LinkRole {
   active  @0;
   backup  @1;
+}
+
+struct LinkStateReport {
+  peerCn @0 :Text;       # the peer's link-certificate CN, as in Link.peerCn
+  state  @1 :LinkState;
+}
+
+enum LinkState {
+  up     @0;  # established, and the peer's certificate verified with CN == peerCn
+  down   @1;  # was up, and is now lost or closed
+  failed @2;  # could not be established (no answer, handshake or certificate refused)
 }

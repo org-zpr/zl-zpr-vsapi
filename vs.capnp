@@ -370,7 +370,9 @@ interface VSHandle {
   # in its current topology or in the links policy declares for it (which include
   # its configured initial links), whether or not setTopology has delivered that
   # link yet. It logs and ignores any other entry (a report can race a topology
-  # change); that is not an error.
+  # change); that is not an error. A link that has never been up on the
+  # non-owner side is not listed (see LinkState and ZODE_LINKS.md "Reporting
+  # summary").
   reportLinkStates  @8 (links :List(LinkStateReport)) -> (res :OkOrError);
 
   # The node's substrate address (the address peers dial, as in the
@@ -782,18 +784,23 @@ struct Ack {
 # The visa service tells a node which links to have with setTopology. The node
 # tells the visa service which of them are up with VSHandle.reportLinkStates; the
 # visa service routes over a link only when both of its ends report it up.
+# The link lifecycle (who dials, what is accepted, what is reported and when) is
+# specified in zl-zpr-dev-context docs/ZODE_LINKS.md.
 
 struct Link {
   linkId   @0 :Text;     # unique, for debugging.
   peer     @1 :SockAddr; # substrate address of the peer
   role     @2 :LinkRole;
   visas    @3 :List(Visa);  # bootstrap visas to aid in joins
-  zprAddr  @4 :IpAddr;   # ZPR address of the peer. May be unset (older senders).
-  peerCn   @5 :Text;     # CN on the peer's CA-signed link certificate. The
-                         # receiving node accepts this link only from a peer
-                         # whose verified certificate carries exactly this CN.
-                         # Empty (older senders) means no peer can satisfy the
-                         # check.
+  zprAddr  @4 :IpAddr;   # Required. ZPR address of the peer; the node compares
+                         # it with its own to decide who dials (ZODE_LINKS.md).
+                         # A link without it is rejected and logged, and the
+                         # rest of the topology is applied.
+  peerCn   @5 :Text;     # Required, non-empty. CN on the peer's CA-signed link
+                         # certificate. The receiving node accepts this link
+                         # only from a peer whose verified certificate carries
+                         # exactly this CN. A link without it is rejected and
+                         # logged, and the rest of the topology is applied.
 }
 
 enum LinkRole {
@@ -806,8 +813,14 @@ struct LinkStateReport {
   state  @1 :LinkState;
 }
 
+# Reported per ZODE_LINKS.md "Reporting summary". The owner of a topology link
+# is the end that dials it (the lower ZPR address; for an initial link, the end
+# that has it configured).
 enum LinkState {
-  up     @0;  # established, and the peer's certificate verified with CN == peerCn
-  down   @1;  # was up, and is now lost or closed
-  failed @2;  # could not be established (no answer, handshake or certificate refused)
+  up     @0;  # established and the peer's certificate verified with
+              # CN == peerCn. Reported by both ends.
+  down   @1;  # was up, and is now lost or closed. Reported by both ends.
+  failed @2;  # reported only by the link's owner, after the link-up window
+              # passed without the link coming up. The non-owner never reports
+              # failed: a link it never saw come up is not listed at all.
 }

@@ -589,6 +589,17 @@ struct Visa {
   constraints @3 :List(Constraint);
   dockPep     @4 :DockPep;   # set on ingress/egress visa only
   fwdPep      @5 :FwdPep;    # if set, forward over a link
+  prevHop     @6 :IpAddr;    # ZPR address of the node this visa's stream arrives from: the
+                             # previous hop on the visa's path. Set by the visa service on
+                             # every intermediary and egress visa; UNSET on the ingress visa,
+                             # which has no previous hop. A node accepts a StreamIdRequest for
+                             # this visa only on the link whose peer's topology ZPR address
+                             # (never a Hello claim) equals prevHop; a visa with prevHop unset
+                             # never accepts one (zl-zipline#243, gap 7). Visas from a visa
+                             # service that predates this field have it unset, so a node
+                             # refuses to bind them for forwarding (flag day). Reverse-direction
+                             # binding for symmetric visas is not defined yet and is refused
+                             # (tracked in zl-zipline#246).
 }
 
 enum VisaType {
@@ -599,6 +610,10 @@ enum VisaType {
 struct FwdPep {
   nextHop   @0 :IpAddr; # link'd node ZPR address (for now)
   symmetric @1 :Bool;   # if true, the visa route applies in both directions
+                        # NOTE: reverse-direction stream binding for symmetric visas is not
+                        # defined yet; nodes accept a StreamIdRequest only from Visa.prevHop
+                        # and refuse reverse binding until it is (zl-zipline#246). The visa
+                        # service never sets this today.
 }
 
 struct DockPep {

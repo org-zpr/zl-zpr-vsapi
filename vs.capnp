@@ -880,7 +880,14 @@ struct Ack {
 
 struct Link {
   linkId   @0 :Text;     # unique, for debugging.
-  peer     @1 :SockAddr; # substrate address of the peer
+  peer     @1 :SockAddr; # Substrate address of the peer, for the end that dials
+                         # this link. Unset when the receiving Zode never dials
+                         # it (the relay; a peer reached through the receiving
+                         # Zode's initial link). A Zode rejects and logs a link
+                         # it owns without one; set, it must be a concrete IP
+                         # and a nonzero port. The visa service proposes a
+                         # direct link only when it knows the address the owner
+                         # must dial (ZODE_LINKS.md rule 13b).
   role     @2 :LinkRole;
   zprAddr  @3 :IpAddr;   # Required. ZPR address of the peer; the node compares
                          # it with its own to decide who dials (ZODE_LINKS.md).

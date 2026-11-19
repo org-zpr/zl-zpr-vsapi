@@ -374,11 +374,21 @@ interface VSGate {
 
 # The operations available to a node once it holds a VS-API session.
 #
-# A node's substrate address (the address its peers dial) is fixed for the life
-# of a session: it is the `substrate_addr` connect param of the `connect` or
-# `open` that started the session. A node whose substrate address changes joins
-# again, and the new session carries the new address. There is no call to change
-# it inside a session.
+# A node's substrate address (the address its peers dial, sent to them as
+# Link.peer) never comes from the node itself (zl-zipline#264). It has exactly
+# two sources:
+#   * policy, when policy declares an address for the node. The operator signs
+#     it, so it always wins;
+#   * otherwise, the relay's observation: the source address of the node's
+#     initial link as the relay's substrate socket saw it, sent as `observedAddr`
+#     on requestBootstrapVisas when that link comes up (J2).
+# With neither, the node has no known address and gets no direct links
+# (ZODE_LINKS.md rule 13b). There is no connect param for it: a `connect` or
+# `open` that carries a `substrate_addr` param is refused with paramError.
+#
+# A node whose substrate address changes loses its initial link and joins again;
+# the relay's request for that rejoin carries the new observation. There is no
+# call to change the address inside a session.
 interface VSHandle {
   registerVss       @0 (addr :SockAddr) -> (res :Result(List(VisaOp)));
 
@@ -439,6 +449,16 @@ interface VSHandle {
   # zprAddr it sends in Link for that peerCn). Nothing the joiner claims about
   # itself is used.
   #
+  # observedAddr: required. The source IP and port of the joiner's initial link
+  # as the relay's substrate socket received it: the joiner's own address, or
+  # the NAT-mapped one when the joiner is behind a NAT. The link has completed
+  # keying with the verified peerCn, so a spoofed source cannot get here. An
+  # IPv4-mapped IPv6 address (::ffff:a.b.c.d, from a dual-stack socket) is
+  # recorded as plain IPv4. When the request is granted, the visa service
+  # records it as the joiner's substrate address, replacing the one from any
+  # previous join, unless policy declares an address for the joiner, which
+  # wins (see VSHandle above).
+  #
   # The narrow rule (J3). The visa service grants the request only when all of
   # these hold:
   #   * the caller is the relay: the node the visa service docks on;
@@ -454,10 +474,11 @@ interface VSHandle {
   # A rejoin. If the visa service still holds a VS-API session for the joiner,
   # this request is the proof that it is gone: a peer has only one link at a
   # time, so the relay holds no other live link for that CN. The visa service
-  # ends the old session and grants the request instead of refusing it. The
-  # joiner may still `reconnect`; the visa service then treats every visa it had
-  # pushed to the joiner as not installed and pushes it again, the VSS visa
-  # included (ZODE_LINKS.md "Settled after the builder check", J6).
+  # ends the old session and grants the request instead of refusing it (J6). It
+  # revokes every visa of the previous join, the joiner's VS-API and VSS visas
+  # included; the joiner's new session gets new ones (J5a, J5b), since visas are
+  # immutable. Every other visa installed on the joiner is treated as not
+  # installed, and is pushed again after the joiner's `reconnect`.
   #
   # What the relay does with the answer:
   #   * installs `BootstrapVisas.relay` (its own copies) before the hand-off, so
@@ -469,12 +490,16 @@ interface VSHandle {
   #     in time, closes the joiner's link instead of handing off; the joiner
   #     retries with its initial-link backoff (J7).
   #
-  # Errors:
-  #   invalidOperation:       the caller is not the relay.
-  #   notFound:               peerCn is not a peer in the caller's topology.
-  #   internal,
-  #   temporarilyUnavailable: the visa service could not mint the visas.
-  requestBootstrapVisas @10 (peerCn :Text) -> (res :Result(BootstrapVisas));
+  # Errors, in the order the visa service checks them:
+  #   authRequired:     the caller's handle is dead (its session has ended).
+  #   invalidOperation: the caller is not the relay, whatever it sent.
+  #   notFound:         peerCn is not a peer in the caller's topology.
+  #   paramError:       observedAddr names no place to dial: an unspecified IP
+  #                     (0.0.0.0, ::, ::ffff:0.0.0.0) or port 0. Nothing is
+  #                     minted and nothing is recorded.
+  #   internal:         the visa service could not mint the visas.
+  requestBootstrapVisas @10 (peerCn :Text, observedAddr :SockAddr)
+      -> (res :Result(BootstrapVisas));
 }
 
 struct LoginNonce {

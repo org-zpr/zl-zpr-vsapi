@@ -142,12 +142,55 @@
 #     authError. On success policy is re-run under the current snapshot and
 #     authExpires is the new minimum across the renewed authorities.
 #
+#   * The exact-set rule always holds for an adapter actor (one docked via a
+#     node). One exception applies to a node renewing its OWN actor (the node's
+#     own ZPR address), which may change its 'user' namespace:
+#       - Gain (login): the request adds an OIDC blob. Its id_token's `nonce`
+#         must equal an unexpired, unused login nonce that getLoginNonce issued,
+#         bound on the visa-service side to this actor and VS-API session.
+#       - Drop (logout): the request omits the OIDC blob; every user attribute
+#         is removed.
+#     The self-signed 'device' blob (the node's RSA proof) is mandatory either
+#     way, and the 'device' namespace can never be gained or dropped. Any other
+#     set mismatch is still a paramError.
+#
 #
 # Visa Requests:
 #
 # Requesting a visa involves the node sending a description of the packet to the
 # Visa Service which then checks the communicating actors and the communication
 # against policy. If a visa is granted it is returned.
+#
+#
+# Visa Management:
+#
+#   * A visa is immutable once granted: the visa service never changes its
+#     expiry, its actor binding, or anything else about it. Renewing or upgrading
+#     a visa always means a NEW visa with a new ID; the old one is revoked or left
+#     to expire.
+#
+#   * A newer visa for an identical five-tuple supersedes an older one. A node
+#     moves a live stream binding onto the newer visa ID atomically (a Stream ID
+#     Request for the new ID, swapped in once it is answered) and then stops
+#     using the older visa. If the move fails the old binding stays until its
+#     visa expires (zl-zpr-dev-context docs/ZODE_LINKS.md, J11).
+#
+#   * A joining Zode reaches the visa service first over two short-lived
+#     bootstrap visas that its relay requests for it (requestBootstrapVisas,
+#     ZODE_LINKS.md J2-J4). Once the Zode has authenticated, the visa service
+#     mints the Zode's own VS-API visas (Zode <-> visa service:VSAPI, both
+#     directions; J5a) and, on registerVss, its VSS visa (visa service -> Zode's
+#     VSS port; J5b). The bootstrap visas are then left to expire.
+#
+#   * The visa service renews a node's three core visas (the two VS-API visas
+#     and the VSS visa) before they expire, at about two-thirds of their
+#     lifetime (J9). Each renewal is a set of new visas pushed over VSS with
+#     pushVisaOp while the current VSS visa is still valid; the node moves onto
+#     them by supersede-and-rebind (above).
+#
+#   * If a Zode's VS-API session fails for any reason, including its core visas
+#     lapsing, the Zode closes its initial link and joins again through its relay
+#     (J10).
 #
 #
 # State:
@@ -157,7 +200,7 @@
 # how to handle pre-existing node state in the visa service (if any). The visa
 # service may decide that a node is irreparably out of sync and in that case if a
 # node attempts to connect with the "reconnect" flag the visa service will return
-# an "invalidState" error, causing the node to clear its state (and disconnect any
+# an "outOfSync" error, causing the node to clear its state (and disconnect any
 # adapters) and try a clean connect.
 #
 # After a reconnect the visa service will tear down any existing connection it may
@@ -329,6 +372,23 @@ interface VSGate {
   authenticate @1 (cresp :ChallengeResponse) -> (res :Result(VSHandle));
 }
 
+# The operations available to a node once it holds a VS-API session.
+#
+# A node's substrate address (the address its peers dial, sent to them as
+# Link.peer) never comes from the node itself (zl-zipline#264). It has exactly
+# two sources:
+#   * policy, when policy declares an address for the node. The operator signs
+#     it, so it always wins;
+#   * otherwise, the relay's observation: the source address of the node's
+#     initial link as the relay's substrate socket saw it, sent as `observedAddr`
+#     on requestBootstrapVisas when that link comes up (J2).
+# With neither, the node has no known address and gets no direct links
+# (ZODE_LINKS.md rule 13b). There is no connect param for it: a `connect` or
+# `open` that carries a `substrate_addr` param is refused with paramError.
+#
+# A node whose substrate address changes loses its initial link and joins again;
+# the relay's request for that rejoin carries the new observation. There is no
+# call to change the address inside a session.
 interface VSHandle {
   registerVss       @0 (addr :SockAddr) -> (res :Result(List(VisaOp)));
 
@@ -348,6 +408,103 @@ interface VSHandle {
   visaRequestById   @6 (req :List(UInt64)) -> (res :Result(List(Visa)));
 
   visaIdsRequest    @7 () -> (res :Result(List(UInt64)));
+
+  # The node reports the current state of its links (see "Topology / Links").
+  # Snapshot semantics: each call lists every link in the node's current topology
+  # plus its configured initial links, and replaces everything this node reported
+  # before. A link the node does not list is not up. The node sends a snapshot
+  # whenever a link state changes, and again after every (re)connect to the visa
+  # service. The visa service accepts an entry whose peerCn is a peer of this node
+  # in its current topology or in the links policy declares for it (which include
+  # its configured initial links), whether or not setTopology has delivered that
+  # link yet. It logs and ignores any other entry (a report can race a topology
+  # change); that is not an error. A link that has never been up on the
+  # non-owner side is not listed (see LinkState and ZODE_LINKS.md "Reporting
+  # summary").
+  reportLinkStates  @8 (links :List(LinkStateReport)) -> (res :OkOrError);
+
+  # The node asks for a nonce for its own OIDC login (adding user attributes to
+  # its own actor through `reauthorize`). The visa service mints a fresh,
+  # unpredictable value and binds it, on its side, to the calling node's actor and
+  # VS-API session; the nonce is single-use and expires at `LoginNonce.expiresAt`.
+  # The node passes it to ph-cli as the authorization request's `nonce`, and
+  # returns it in `OidcBlob.nonce`. A login (namespace gain) is accepted only when
+  # the id_token's `nonce` claim equals an unexpired nonce the visa service issued
+  # to this node and has not yet used. The schema carries no binding fields: the
+  # binding lives on the visa-service side.
+  # See "Re-Authorization" above for the namespace-gain exception this serves.
+  # Errors: authRequired on a dead handle; quotaExceeded when the node already
+  # holds the maximum number of outstanding nonces.
+  getLoginNonce     @9 () -> (res :Result(LoginNonce));
+
+  # The relay asks for the bootstrap visas of a Zode that is joining over an
+  # initial link to it (zl-zpr-dev-context docs/ZODE_LINKS.md, J2-J4 and J7).
+  #
+  # When: as soon as the joiner's initial link is up, the relay calls this over
+  # its own VS-API session. The joiner has no session yet, and these visas are
+  # what let it open one.
+  #
+  # peerCn: the CN on the joiner's verified link certificate. The visa service
+  # maps it to the joiner's ZPR address through the relay's topology (the same
+  # zprAddr it sends in Link for that peerCn). Nothing the joiner claims about
+  # itself is used.
+  #
+  # observedAddr: required. The source IP and port of the joiner's initial link
+  # as the relay's substrate socket received it: the joiner's own address, or
+  # the NAT-mapped one when the joiner is behind a NAT. The link has completed
+  # keying with the verified peerCn, so a spoofed source cannot get here. An
+  # IPv4-mapped IPv6 address (::ffff:a.b.c.d, from a dual-stack socket) is
+  # recorded as plain IPv4. When the request is granted, the visa service
+  # records it as the joiner's substrate address, replacing the one from any
+  # previous join, unless policy declares an address for the joiner, which
+  # wins (see VSHandle above).
+  #
+  # The narrow rule (J3). The visa service grants the request only when all of
+  # these hold:
+  #   * the caller is the relay: the node the visa service docks on;
+  #   * peerCn names a peer of the caller in the caller's topology, from the
+  #     policy-declared peering;
+  # and it mints visas for exactly one flow, the joiner's VS-API session with the
+  # visa service, in both directions:
+  #   * forward: joiner -> visa service:VSAPI port;
+  #   * reverse: visa service:VSAPI port -> joiner.
+  # The visas are short-lived (a few minutes): they only have to carry the
+  # joiner's authentication (J3, J5c). Each request mints new visas.
+  #
+  # A rejoin. If the visa service still holds a VS-API session for the joiner,
+  # this request is the proof that it is gone: a peer has only one link at a
+  # time, so the relay holds no other live link for that CN. The visa service
+  # ends the old session and grants the request instead of refusing it (J6). It
+  # revokes every visa of the previous join, the joiner's VS-API and VSS visas
+  # included; the joiner's new session gets new ones (J5a, J5b), since visas are
+  # immutable. Every other visa installed on the joiner is treated as not
+  # installed, and is pushed again after the joiner's `reconnect`.
+  #
+  # What the relay does with the answer:
+  #   * installs `BootstrapVisas.relay` (its own copies) before the hand-off, so
+  #     the joiner's first packet already matches at the relay;
+  #   * hands `BootstrapVisas.peer` to the joiner in the ZDP `Bootstrap Visas`
+  #     message (type 146) on that initial link, and never installs them itself
+  #     (J4);
+  #   * on any error, or if it has no VS-API session or the call does not answer
+  #     in time, closes the joiner's link instead of handing off; the joiner
+  #     retries with its initial-link backoff (J7).
+  #
+  # Errors, in the order the visa service checks them:
+  #   authRequired:     the caller's handle is dead (its session has ended).
+  #   invalidOperation: the caller is not the relay, whatever it sent.
+  #   notFound:         peerCn is not a peer in the caller's topology.
+  #   paramError:       observedAddr names no place to dial: an unspecified IP
+  #                     (0.0.0.0, ::, ::ffff:0.0.0.0) or port 0. Nothing is
+  #                     minted and nothing is recorded.
+  #   internal:         the visa service could not mint the visas.
+  requestBootstrapVisas @10 (peerCn :Text, observedAddr :SockAddr)
+      -> (res :Result(BootstrapVisas));
+}
+
+struct LoginNonce {
+  nonce     @0 :Text;    # the OIDC `nonce` value, used verbatim
+  expiresAt @1 :UInt64;  # unix timestamp (seconds); unusable after this time
 }
 
 struct OkOrError {
@@ -539,6 +696,28 @@ struct Visa {
   constraints @3 :List(Constraint);
   dockPep     @4 :DockPep;   # set on ingress/egress visa only
   fwdPep      @5 :FwdPep;    # if set, forward over a link
+  prevHop     @6 :IpAddr;    # ZPR address of the node this visa's stream arrives from: the
+                             # previous hop on the visa's path. Set by the visa service on
+                             # every intermediary and egress visa; UNSET on the ingress visa,
+                             # which has no previous hop. A node accepts a StreamIdRequest for
+                             # this visa only on the link whose peer's topology ZPR address
+                             # (never a Hello claim) equals prevHop; a visa with prevHop unset
+                             # never accepts one (zl-zipline#243, gap 7). Visas from a visa
+                             # service that predates this field have it unset, so a node
+                             # refuses to bind them for forwarding (flag day). Reverse-direction
+                             # binding for symmetric visas is not defined yet and is refused
+                             # (tracked in zl-zipline#246).
+}
+
+# The answer to VSHandle.requestBootstrapVisas: both directions of one joiner's
+# VS-API flow (forward joiner -> visa service:VSAPI, and the reverse), in two
+# copies (ZODE_LINKS.md J2-J4). Each list holds exactly two visas, one per
+# direction; a receiver rejects any other count.
+struct BootstrapVisas {
+  peer  @0 :List(Visa);  # The joiner's copies. The relay forwards them in ZDP
+                         # message 146 and never installs them.
+  relay @1 :List(Visa);  # The relay's own copies of the same two flows. The
+                         # relay installs them before it hands `peer` off.
 }
 
 enum VisaType {
@@ -549,6 +728,10 @@ enum VisaType {
 struct FwdPep {
   nextHop   @0 :IpAddr; # link'd node ZPR address (for now)
   symmetric @1 :Bool;   # if true, the visa route applies in both directions
+                        # NOTE: reverse-direction stream binding for symmetric visas is not
+                        # defined yet; nodes accept a StreamIdRequest only from Visa.prevHop
+                        # and refuse reverse binding until it is (zl-zipline#246). The visa
+                        # service never sets this today.
 }
 
 struct DockPep {
@@ -714,15 +897,52 @@ struct Ack {
 # Topology / Links
 # ---------------------------------------------------
 
+# The visa service tells a node which links to have with setTopology. The node
+# tells the visa service which of them are up with VSHandle.reportLinkStates; the
+# visa service routes over a link only when both of its ends report it up.
+# The link lifecycle (who dials, what is accepted, what is reported and when) is
+# specified in zl-zpr-dev-context docs/ZODE_LINKS.md.
+
 struct Link {
   linkId   @0 :Text;     # unique, for debugging.
-  peer     @1 :SockAddr; # substrate address of the peer
+  peer     @1 :SockAddr; # Substrate address of the peer, for the end that dials
+                         # this link. Unset when the receiving Zode never dials
+                         # it (the relay; a peer reached through the receiving
+                         # Zode's initial link). A Zode rejects and logs a link
+                         # it owns without one; set, it must be a concrete IP
+                         # and a nonzero port. The visa service proposes a
+                         # direct link only when it knows the address the owner
+                         # must dial (ZODE_LINKS.md rule 13b).
   role     @2 :LinkRole;
-  visas    @3 :List(Visa);  # bootstrap visas to aid in joins
-  zprAddr  @4 :IpAddr;   # ZPR address of the peer. May be unset (older senders).
+  zprAddr  @3 :IpAddr;   # Required. ZPR address of the peer; the node compares
+                         # it with its own to decide who dials (ZODE_LINKS.md).
+                         # A link without it is rejected and logged, and the
+                         # rest of the topology is applied.
+  peerCn   @4 :Text;     # Required, non-empty. CN on the peer's CA-signed link
+                         # certificate. The receiving node accepts this link
+                         # only from a peer whose verified certificate carries
+                         # exactly this CN. A link without it is rejected and
+                         # logged, and the rest of the topology is applied.
 }
 
 enum LinkRole {
   active  @0;
   backup  @1;
+}
+
+struct LinkStateReport {
+  peerCn @0 :Text;       # the peer's link-certificate CN, as in Link.peerCn
+  state  @1 :LinkState;
+}
+
+# Reported per ZODE_LINKS.md "Reporting summary". The owner of a topology link
+# is the end that dials it (the lower ZPR address; for an initial link, the end
+# that has it configured).
+enum LinkState {
+  up     @0;  # established and the peer's certificate verified with
+              # CN == peerCn. Reported by both ends.
+  down   @1;  # was up, and is now lost or closed. Reported by both ends.
+  failed @2;  # reported only by the link's owner, after the link-up window
+              # passed without the link coming up. The non-owner never reports
+              # failed: a link it never saw come up is not listed at all.
 }
